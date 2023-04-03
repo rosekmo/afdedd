@@ -1,0 +1,181 @@
+public:
+    /**
+     * constructor
+     */
+	System( string symbol_ = NULL, int timeframe_ = PERIOD_CURRENT ):
+	Context( symbol_, timeframe_ ),
+	name( NULL ),
+	// ロジック
+	closes( new CArrayObj() ), filters( new CArrayObj() ), sizing(NULL), stop(NULL), trigger(NULL), open(NULL), plugins( new CArrayObj() ),
+	// 足の進捗状態
+	barsCurrentTimeframe( -1 ),
+	barsM1(-1), barsM5(-1), barsM15(-1), barsM30(-1), barsH1(-1), barsH4(-1), barsD1(-1), barsW1(-1), barsMN1(-1),
+	errorList(new CArrayInt()), numRequest(0), timeline(new CArrayInt()), values(new CArrayFloat()), errors(new CArrayObj()), requests(new CArrayInt()),
+	totalSystemError(0)
+	{
+		startAt = TimeCurrent();
+		Print("new System");
+
+	    debugEnabled = false;
+	};
+
+	/**
+	 * destructor
+	 */
+	~System(){
+	    outputLog();
+	};
+
+public:
+
+    /**
+     * triggerのリクエストを捌く
+     * generate a new order.
+     * @return Order*
+     */
+	virtual OrderInfo* order( OrderRequest* request ) {
+	    log( "-- order ------------------------------" );
+	    log( "-- " + toString() );
+        numRequest++;
+
+        int i, len;
+
+        // 開始値を設定
+		if( request.price == -1 && open != NULL ) open.setup( request );
+		// 指定がない場合は成り行き
+		if( request.price == -1 ) {
+			switch( request.operation ) {
+				case BUY: case BUYLIMIT: case BUYSTOP:
+					request.price = Ask;
+					break;
+				case SELL: case SELLLIMIT: case SELLSTOP:
+					request.price = Bid;
+					break;
+			}
+		}
+		// 値を丸める
+		request.price = round( request.price / Point() ) * Point();
+
+		// フィルターをかます
+		for( i=0, len=filters.Total(); i < len; i++ ) {
+			Filter* filter = filters.At(i);
+			if( filter.doTest( request ) != true ) {
+				log( "--  filterd : " + filter.toString() );
+				return NULL;
+			}
+		}
+
+		// 手仕舞いロジックの反映
+		for( i=0, len=closes.Total(); i < len; i++ ) {
+			Close* close = closes.At(i);
+			close.setup( request );
+		}
+
+		// 損切りロジックの反映
+		if( stop != NULL ) request.stoploss = stop.calc( request );
+
+		// 利食いロジックの反映
+		if( takeProfit != NULL ) request.takeprofit = takeProfit.calc( request );
+
+		// ポジションサイジングロジックの反映
+		if( sizing != NULL ) request.volume = sizing.calc( request );
+
+        // オーダー
+		OrderInfo* order = sendOrderRequest( request );
+		if( order == NULL ){
+            log( "--  OrderRequest failed" );
+
+			// エラーの取り回し
+			//  エラーコードを溜めてレポートとして出力する。
+			int errorCode = GetLastError();
+			errorList.Add( errorCode );
+			//  エラー件数の加算
+			totalSystemError++;
+			if( totalSystemError > ALLOWABLE_NUM_ERROR ) {
+			    CustomError::SYSTEM_DOWN_BY_ERRORS();
+			    errorCode = GetLastError();
+                errorList.Add( errorCode );
+			}
+
+			switch( errorCode ) {
+			    case 130: // ERR_INVALID_STOPS
+			        Print("order ERROR 130.", request.isBuy() ? "BUY": "SELL" ," price:", request.price, " stop:", request.stoploss );
+			        break;
+			    case 131: // ERR_INVALID_TRADE_VOLUME
+			        Print("order ERROR 131. volume:", request.volume );
+			        break;
+                case ERROR_OUT_OF_RANGE_TRADE_VOLUME:
+			        Print("order ERROR TRADE_VOLUME. volume:", request.volume, " rounded:", roundLot( request.volume ) );
+			        break;
+                default:
+			        Print("order ERROR ", errorCode, ". @see : http://docs.mql4.com/constants/errorswarnings/enum_trade_return_codes" );
+			}
+
+			return NULL;
+		}
+
+		//
+		getOrders().Add( order );
+
+		return order;
+	}
+
+    /**
+     * processing of every tick.
+     * TODO high-load
+     */
+	void tick() {
+
+	    // down... ログ出力だけ行う
+        if( totalSystemError > ALLOWABLE_NUM_ERROR ) {
+            // D1
+            int tmp = iBars( getSymbol(), PERIOD_D1 );
+            if( barsD1 != tmp ){
+                barsD1=tmp;
+                updateLogs();
+            }
+            return;
+        }
+
+        // TODO 未約定オーダーの状況把握と更新
+
+        // TODO ⇡とマージ
+//		checkClosedOrders();
+
+        //
+		onTick();
+
+        // Periods
+        tryNotifyUpdatedPeriodBars();
+
+        //
+		onTickAfter();
+	};
+
+	void onTimer(){
+
+		UseEvent( TIMER );
+		notify( TIMER );
+	}
+
+private:
+
+    /**
+     * remove closed orders.
+     * TODO realtime
+     */
+	void checkClosedOrders(){
+
+		CArrayObj* orders = getOrders();
+		for( int i = 0; i < orders.Total(); i++ ) {
+			OrderInfo* order = orders.At( i );
+			if( order.isClosed() ) {
+				Print( "Closed!! id:", order.getTicketId() );
+				orders.Detach( i );
+				i--;
+			}
+		}
+	}
+
+
+    /**
